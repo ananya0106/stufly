@@ -58,7 +58,8 @@ def search_direct(
 ):
     """
     Returns the cheapest direct flight for a given route + date.
-    Includes any matching student discount programs for the operating airline.
+    Includes original price, discounted_price (after best applicable student
+    % discount), and any matching student discount programs for the airline.
     """
     origin = origin.upper()
     destination = destination.upper()
@@ -70,6 +71,7 @@ def search_direct(
         )
 
     result["student_discounts"] = get_discounts_for_airline(result["airlines"])
+    # discounted_price and applied_discount are already set inside search_direct_flight()
 
     return result
 
@@ -85,7 +87,8 @@ async def search_reroute(
     routing than flying direct. Results are cached per (origin, destination, date)
     for an hour, hub checks run concurrently (capped at 3 at once), and each
     hub gets retried on transient failure before being marked failed. Each leg
-    of each option is annotated with any matching student discount programs.
+    of each option is annotated with matching student discount programs and a
+    discounted price; discounted_total_price sums both legs' discounted prices.
     """
     origin = origin.upper()
     destination = destination.upper()
@@ -104,6 +107,10 @@ async def search_reroute(
     for option in results:
         option["leg1"]["student_discounts"] = get_discounts_for_airline(option["leg1"]["airlines"])
         option["leg2"]["student_discounts"] = get_discounts_for_airline(option["leg2"]["airlines"])
+        # leg1/leg2 already carry discounted_price + applied_discount from search_direct_flight()
+        option["discounted_total_price"] = (
+            option["leg1"]["discounted_price"] + option["leg2"]["discounted_price"]
+        )
 
     response = {
         "origin": origin,

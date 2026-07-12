@@ -1,4 +1,5 @@
 from cache import reroute_cache
+from discounts import get_best_price_discount
 import asyncio
 from datetime import datetime
 
@@ -73,12 +74,16 @@ def search_direct_flight(origin: str, destination: str, travel_date: str):
     best = results[0]
     leg = best.flights[0]  # the first physical flight segment
 
+    discounted_price, applied_discount = get_best_price_discount(best.airlines, best.price)
+
     return {
         "origin": origin,
         "destination": destination,
         "date": travel_date,
         "airlines": best.airlines,
-        "price": best.price,  # already an int, e.g. 45231
+        "price": best.price,  # original price, e.g. 45231
+        "discounted_price": discounted_price,  # after best student % discount, same as price if none applies
+        "applied_discount": applied_discount,  # the specific program used, or None
         "duration_minutes": leg.duration,
         "plane_type": leg.plane_type,
         "num_legs": len(best.flights),  # >1 means it's a connecting flight

@@ -79,3 +79,26 @@ def get_discounts_for_airline(airline_name: str):
                 break
 
     return matches
+
+
+def get_best_price_discount(airline_name: str, price: int):
+    """
+    Finds the best applicable *percentage* discount for an airline and
+    computes the resulting discounted price. Extra_baggage-type discounts
+    are ignored here since they don't reduce fare -- they stay purely
+    informational in the applicable_discounts list.
+
+    Returns (discounted_price, applied_discount) -- applied_discount is
+    None if no percentage discount applies.
+    """
+    programs = get_discounts_for_airline(airline_name)
+    percentage_programs = [p for p in programs if p["discount_type"] == "percentage"]
+
+    if not percentage_programs:
+        return price, None
+
+    # pick the single best (highest %) discount rather than stacking multiple
+    best = max(percentage_programs, key=lambda p: p["discount_value"])
+    discounted_price = round(price * (1 - best["discount_value"] / 100))
+
+    return discounted_price, best
