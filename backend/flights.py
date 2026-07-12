@@ -1,3 +1,10 @@
+from cache import reroute_cache
+import asyncio
+from datetime import datetime
+
+from fast_flights import FlightQuery, Passengers, create_query, get_flights
+from fast_flights.exceptions import FlightsNotFound
+
 """
 flights.py
 -----------
@@ -8,16 +15,13 @@ fast-flights directly. If fast-flights changes its internals again,
 we only fix this one file instead of hunting through every endpoint.
 
 NOTE ON VERSIONS: fast-flights has changed its API before (older docs
-export FlightData/get_flights(flight_data=...), but v3.0.2 — what
-actually installs today — exports FlightQuery + create_query() instead).
+export FlightData/get_flights(flight_data=...), but v3.0.2 -- what
+actually installs today -- exports FlightQuery + create_query() instead).
 Always check with
     python3 -c "import fast_flights; print(dir(fast_flights))"
 before trusting any tutorial, including this one, if pip installs a
 different version later.
 """
-
-from fast_flights import FlightQuery, Passengers, create_query, get_flights
-from fast_flights.exceptions import FlightsNotFound
 
 
 def search_direct_flight(origin: str, destination: str, travel_date: str):
@@ -51,7 +55,7 @@ def search_direct_flight(origin: str, destination: str, travel_date: str):
     except FlightsNotFound:
         return None
     except Exception as e:
-        # fast-flights is a scraper, not an official API — Google can serve
+        # fast-flights is a scraper, not an official API -- Google can serve
         # a different page layout, a CAPTCHA, or a blocked response, and the
         # library will fail to parse it. We don't want that to crash our
         # whole endpoint, so we catch broadly here and log what happened.
@@ -79,3 +83,70 @@ def search_direct_flight(origin: str, destination: str, travel_date: str):
         "plane_type": leg.plane_type,
         "num_legs": len(best.flights),  # >1 means it's a connecting flight
     }
+
+
+async def _search_hub(origin: str, destination: str, travel_date: str, hub: str, semaphore: asyncio.Semaphore):
+    """
+    Checks one hub: origin -> hub -> destination.
+    Runs search_direct_flight (sync, scraper-based) in a thread so it
+    doesn't block the event loop while other hubs are being checked.
+    """
+    async with semaphore:
+        try:
+            leg1 = await asyncio.to_thread(search_direct_flight, origin, hub, travel_date)
+            leg2 = await asyncio.to_thread(search_direct_flight, hub, destination, travel_date)
+
+            if leg1 and leg2:
+                return {
+                    "hub": hub,
+                    "leg1": leg1,
+                    "leg2": leg2,
+                    "total_price": leg1["price"] + leg2["price"],
+                }
+
+            return {
+                "hub": hub,
+                "error": "no_results",
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+
+        except Exception as e:
+            return {
+                "hub": hub,
+                "error": str(e),
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+
+
+async def search_reroute_options(origin: str, destination: str, travel_date: str, hubs: list[str]):
+    """
+    Checks a list of candidate hub airports for a cheaper origin->hub->destination
+    routing than a direct flight. Runs hub checks concurrently (capped at 3 at once)
+    and caches results per (origin, destination, date) for an hour.
+    """
+    cached = reroute_cache.get(origin, destination, travel_date)
+    if cached is not None:
+        print(f"[cache] hit for {origin}-{destination}-{travel_date}")
+        return cached["results"], cached["failures"]
+
+    print(f"[cache] miss for {origin}-{destination}-{travel_date}, scraping...")
+
+    semaphore = asyncio.Semaphore(3)  # cap concurrent hub checks so we don't hammer the scraper
+    tasks = [_search_hub(origin, destination, travel_date, hub, semaphore) for hub in hubs]
+    raw_results = await asyncio.gather(*tasks)
+
+    results = [r for r in raw_results if r and "error" not in r]
+    failures = [r for r in raw_results if r and "error" in r]
+
+    if failures:
+        print(f"[reroute] {len(failures)} hub(s) failed:")
+        for f in failures:
+            print(f"  - {f['timestamp']} | hub={f['hub']} | error={f['error']}")
+
+    if results:
+        reroute_cache.set(origin, destination, travel_date, {
+            "results": results,
+            "failures": failures,
+        })
+
+    return results, failures
