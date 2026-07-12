@@ -1,3 +1,6 @@
 fastapi
 uvicorn
 fast-flights
+groq
+slowapi
+python-dotenv

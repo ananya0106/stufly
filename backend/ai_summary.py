@@ -1,77 +1,80 @@
 """
 ai_summary.py
 -------------
-Takes the ALREADY-COMPUTED reroute data (real prices, real savings —
-nothing here is invented by the AI) and asks Claude to turn it into a
-short, human-readable summary.
+Takes the ALREADY-COMPUTED reroute results (real prices, real savings --
+nothing here is invented by the AI) and asks Groq's Llama model to turn
+it into a short, human-readable summary.
 
-Important design rule: the AI never sees raw prices without them
-already being real numbers from fast-flights. It only narrates data
-we've already validated. This keeps a hallucination from ever turning
-into a fake price shown to a user.
+Important design rule: the AI never sees raw prices without them already
+being real numbers from fast-flights. It only narrates data we've already
+validated. This keeps a hallucination from ever turning into a fake price
+shown to a user.
 
-Requires: pip install anthropic
-Requires: an ANTHROPIC_API_KEY environment variable set.
-    export ANTHROPIC_API_KEY="sk-ant-..."
-Get a key at https://console.anthropic.com
+Requires: GROQ_API_KEY environment variable set (see .env).
+Get a key at https://console.groq.com
 """
-
 import os
-from anthropic import Anthropic
+from groq import Groq
 
-client = Anthropic()  # reads ANTHROPIC_API_KEY from the environment automatically
-
-MODEL = "claude-haiku-4-5-20251001"  # cheap + fast, right fit for short narration
+_client = None
 
 
-def summarize_reroute(reroute_data: dict) -> str:
+def _get_client():
+    """Lazy init so a missing key doesn't crash the whole app at import time."""
+    global _client
+    if _client is None:
+        _client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    return _client
+
+
+MODEL = "llama-3.1-8b-instant"  # fast + cheap, right fit for short narration
+
+
+def summarize_reroute(origin: str, destination: str, travel_date: str, results: list, direct_price: int = None) -> str:
     """
     Args:
-        reroute_data: the exact dict returned by search_reroute_options()
-                       i.e. {"direct": {...}, "alternatives": [...]}
+        origin, destination, travel_date: the searched route
+        results: the exact list returned by search_reroute_options() --
+                  each item has hub, leg1, leg2, total_price, discounted_total_price
+        direct_price: optional, the direct flight price for comparison if available
 
     Returns:
-        A short (1-3 sentence) plain-English summary string.
+        A short (1-2 sentence) plain-English summary string.
         Falls back to a simple template if the API call fails, so a
-        flaky/missing API key never breaks the whole search endpoint.
+        flaky/missing key never breaks the whole search endpoint.
     """
-    direct = reroute_data.get("direct")
-    alternatives = reroute_data.get("alternatives", [])
+    if not results:
+        return f"No reroute options found for {origin} -> {destination} on {travel_date}."
 
-    if not alternatives:
-        if direct:
-            return f"No cheaper rerouting options found — the direct flight at ₹{direct['price']} is your best bet."
-        return "No flights found for this route."
+    best = results[0]  # already sorted cheapest-first by the caller
 
-    best = alternatives[0]  # already sorted by savings, highest first
-
-    # We hand Claude ONLY the numbers we've already computed — it is
-    # explicitly told not to introduce any figure that isn't given to it.
-    prompt = f"""Here is real flight data (already computed, do not alter any numbers):
-
-Direct flight: {direct['origin']} -> {direct['destination']}, price ₹{direct['price']}, {direct['duration_minutes']} minutes, {direct['airlines']}
-
-Best alternative: via {best['hub']}
-  Leg 1: {best['leg1']['origin']} -> {best['leg1']['destination']}, ₹{best['leg1']['price']}, {best['leg1']['duration_minutes']} min
-  Leg 2: {best['leg2']['origin']} -> {best['leg2']['destination']}, ₹{best['leg2']['price']}, {best['leg2']['duration_minutes']} min
-  Total: ₹{best['combo_price']}, savings: ₹{best['savings']}
-
-Total alternatives found: {len(alternatives)}
-
-Write a 1-2 sentence, friendly, plain-English summary a traveler would read on a search results page. Only use the numbers given above — do not calculate or invent any new figures. Mention the savings and briefly note the tradeoff (extra stop, separate tickets)."""
+    fallback = (
+        f"Flying via {best['hub']} costs {best['total_price']} "
+        f"(discounted: {best.get('discounted_total_price', best['total_price'])})."
+    )
 
     try:
-        response = client.messages.create(
+        prompt = f"""Here is real flight data (already computed, do not alter any numbers):
+
+Route: {origin} -> {destination} on {travel_date}
+Best reroute option: via {best['hub']}
+  Leg 1: {best['leg1']['origin']} -> {best['leg1']['destination']}, price {best['leg1']['price']}, discounted {best['leg1'].get('discounted_price', best['leg1']['price'])}
+  Leg 2: {best['leg2']['origin']} -> {best['leg2']['destination']}, price {best['leg2']['price']}, discounted {best['leg2'].get('discounted_price', best['leg2']['price'])}
+  Total: {best['total_price']}, discounted total: {best.get('discounted_total_price', best['total_price'])}
+{f"Direct flight price for comparison: {direct_price}" if direct_price else ""}
+Total alternatives found: {len(results)}
+
+Write a 1-2 sentence, friendly, plain-English summary a traveler would read on a search results page. Only use the numbers given above -- do not calculate or invent any new figures. Mention the price and briefly note the tradeoff (extra stop, separate tickets), and mention if a student discount is already reflected in the discounted total."""
+
+        response = _get_client().chat.completions.create(
             model=MODEL,
             max_tokens=150,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.content[0].text.strip()
+        return response.choices[0].message.content.strip()
+
     except Exception as e:
         # If the API call fails for any reason (bad key, rate limit, network),
         # fall back to a plain template instead of breaking the endpoint.
         print(f"[ai_summary error] {e}")
-        return (
-            f"Flying via {best['hub']} saves ₹{best['savings']} "
-            f"compared to the direct flight (₹{best['combo_price']} vs ₹{direct['price']})."
-        )
+        return fallback
