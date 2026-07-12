@@ -80,7 +80,8 @@ async def search_reroute(
     """
     Checks candidate hub airports for a cheaper origin->hub->destination
     routing than flying direct. Results are cached per (origin, destination, date)
-    for an hour, and hub checks run concurrently (capped at 3 at once).
+    for an hour, hub checks run concurrently (capped at 3 at once), and each
+    hub gets retried on transient failure before being marked failed.
     """
     origin = origin.upper()
     destination = destination.upper()
@@ -90,19 +91,28 @@ async def search_reroute(
     if not results:
         raise HTTPException(
             status_code=404,
-            detail=f"No reroute options found for {origin} -> {destination} on {travel_date}",
+            detail=f"No reroute options found for {origin} -> {destination} on {travel_date} "
+                   f"({len(failures)} of {len(DEFAULT_HUBS)} hubs failed)",
         )
 
-    # sort cheapest first so the frontend can just take results[0] as "the" best option
     results.sort(key=lambda r: r["total_price"])
 
-    return {
+    response = {
         "origin": origin,
         "destination": destination,
         "date": travel_date,
         "options": results,
         "failed_hubs": [f["hub"] for f in failures],
     }
+
+    # partial success -- some hubs failed but we still have usable results
+    if failures:
+        response["warning"] = (
+            f"{len(failures)} of {len(DEFAULT_HUBS)} hubs could not be checked "
+            f"({', '.join(f['hub'] for f in failures)}); results may not be complete"
+        )
+
+    return response
 
 
 @app.get("/debug/cache")

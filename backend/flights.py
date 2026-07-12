@@ -85,37 +85,68 @@ def search_direct_flight(origin: str, destination: str, travel_date: str):
     }
 
 
-async def _search_hub(origin: str, destination: str, travel_date: str, hub: str, semaphore: asyncio.Semaphore):
+async def _search_hub(
+    origin: str,
+    destination: str,
+    travel_date: str,
+    hub: str,
+    semaphore: asyncio.Semaphore,
+    max_retries: int = 2,
+    timeout_seconds: int = 20,
+):
     """
     Checks one hub: origin -> hub -> destination.
-    Runs search_direct_flight (sync, scraper-based) in a thread so it
-    doesn't block the event loop while other hubs are being checked.
+    Retries transient failures (network blips, rate limits) up to
+    max_retries times with a short backoff, and caps each attempt
+    with a timeout so one stuck hub can't stall the whole batch.
     """
     async with semaphore:
-        try:
-            leg1 = await asyncio.to_thread(search_direct_flight, origin, hub, travel_date)
-            leg2 = await asyncio.to_thread(search_direct_flight, hub, destination, travel_date)
+        last_error = None
 
-            if leg1 and leg2:
+        for attempt in range(1, max_retries + 1):
+            try:
+                leg1 = await asyncio.wait_for(
+                    asyncio.to_thread(search_direct_flight, origin, hub, travel_date),
+                    timeout=timeout_seconds,
+                )
+                leg2 = await asyncio.wait_for(
+                    asyncio.to_thread(search_direct_flight, hub, destination, travel_date),
+                    timeout=timeout_seconds,
+                )
+
+                if leg1 and leg2:
+                    return {
+                        "hub": hub,
+                        "leg1": leg1,
+                        "leg2": leg2,
+                        "total_price": leg1["price"] + leg2["price"],
+                    }
+
+                # got a clean response but no flights exist on this route --
+                # not a transient error, retrying won't help, so stop here
                 return {
                     "hub": hub,
-                    "leg1": leg1,
-                    "leg2": leg2,
-                    "total_price": leg1["price"] + leg2["price"],
+                    "error": "no_results",
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
                 }
 
-            return {
-                "hub": hub,
-                "error": "no_results",
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            }
+            except asyncio.TimeoutError:
+                last_error = f"timeout after {timeout_seconds}s"
+            except Exception as e:
+                last_error = str(e)
 
-        except Exception as e:
-            return {
-                "hub": hub,
-                "error": str(e),
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            }
+            # a real failure happened -- back off before retrying,
+            # unless this was the last attempt
+            if attempt < max_retries:
+                print(f"[reroute] hub={hub} attempt {attempt} failed ({last_error}), retrying...")
+                await asyncio.sleep(2 * attempt)  # 2s, then 4s, etc.
+
+        # all retries exhausted
+        return {
+            "hub": hub,
+            "error": last_error,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
 
 
 async def search_reroute_options(origin: str, destination: str, travel_date: str, hubs: list[str]):
