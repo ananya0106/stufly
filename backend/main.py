@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from flights import search_direct_flight, search_reroute_options
 from cache import reroute_cache
+from discounts import get_all_discounts, get_discounts_for_airline
 
 app = FastAPI(title="Flight Reroute + Student Fares API")
 
@@ -57,8 +58,7 @@ def search_direct(
 ):
     """
     Returns the cheapest direct flight for a given route + date.
-    This is the simplest possible endpoint -- no reroute logic,
-    just: does fast-flights give us real data back.
+    Includes any matching student discount programs for the operating airline.
     """
     origin = origin.upper()
     destination = destination.upper()
@@ -68,6 +68,9 @@ def search_direct(
             status_code=404,
             detail=f"No flights found for {origin} -> {destination} on {travel_date}",
         )
+
+    result["student_discounts"] = get_discounts_for_airline(result["airlines"])
+
     return result
 
 
@@ -81,7 +84,8 @@ async def search_reroute(
     Checks candidate hub airports for a cheaper origin->hub->destination
     routing than flying direct. Results are cached per (origin, destination, date)
     for an hour, hub checks run concurrently (capped at 3 at once), and each
-    hub gets retried on transient failure before being marked failed.
+    hub gets retried on transient failure before being marked failed. Each leg
+    of each option is annotated with any matching student discount programs.
     """
     origin = origin.upper()
     destination = destination.upper()
@@ -97,6 +101,10 @@ async def search_reroute(
 
     results.sort(key=lambda r: r["total_price"])
 
+    for option in results:
+        option["leg1"]["student_discounts"] = get_discounts_for_airline(option["leg1"]["airlines"])
+        option["leg2"]["student_discounts"] = get_discounts_for_airline(option["leg2"]["airlines"])
+
     response = {
         "origin": origin,
         "destination": destination,
@@ -105,7 +113,6 @@ async def search_reroute(
         "failed_hubs": [f["hub"] for f in failures],
     }
 
-    # partial success -- some hubs failed but we still have usable results
     if failures:
         response["warning"] = (
             f"{len(failures)} of {len(DEFAULT_HUBS)} hubs could not be checked "
@@ -113,6 +120,15 @@ async def search_reroute(
         )
 
     return response
+
+
+@app.get("/discounts/student")
+def list_student_discounts():
+    """
+    Returns all known student discount programs. This is the browsable
+    catalog the frontend can show on its own page, independent of any search.
+    """
+    return {"programs": get_all_discounts()}
 
 
 @app.get("/debug/cache")
