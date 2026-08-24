@@ -7,8 +7,8 @@ Run locally with:
 Then visit http://127.0.0.1:8000/docs to test it in the browser.
 
 Auth: all routes except / require an X-API-Key header matching API_KEY
-in .env. Set API_KEY=dev-local-key (or anything) in .env for local testing;
-generate a real random one before any real deployment.
+in .env. Set API_KEY=dev-local-key-123 (or anything) in .env for local
+testing; generate a real random one before any real deployment.
 """
 import os
 from datetime import datetime, date
@@ -27,12 +27,10 @@ from flights import search_direct_flight, search_reroute_options
 from cache import reroute_cache
 from discounts import get_all_discounts, get_discounts_for_airline
 from ai_summary import summarize_reroute
+from nlp_intent import resolve_full_intent
 
 app = FastAPI(title="Flight Reroute + Student Fares API")
 
-# --- Rate limiting: caps how often any one IP can hit an endpoint, so a
-# buggy frontend retry loop or a malicious script can't hammer the scraper
-# (and burn our standing with Google) or run up Groq API costs. ---
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -57,11 +55,7 @@ def require_dev():
 
 
 def require_api_key(x_api_key: str = Header(None)):
-    """
-    Simple shared-secret auth. Every protected route depends on this.
-    If API_KEY isn't set in .env at all, auth is effectively disabled --
-    fine for early local dev, but flagged so it's not forgotten before deploy.
-    """
+    """Simple shared-secret auth for every protected route."""
     if API_KEY is None:
         print("[auth warning] API_KEY not set in .env -- all routes are unprotected")
         return
@@ -70,10 +64,7 @@ def require_api_key(x_api_key: str = Header(None)):
 
 
 def validate_travel_date(travel_date: str) -> str:
-    """
-    Confirms travel_date is a real, sane date before it ever reaches the
-    scraper. Returns the validated string unchanged, or raises a clean 400.
-    """
+    """Confirms travel_date is a real, sane date before it reaches the scraper."""
     try:
         parsed = datetime.strptime(travel_date, "%Y-%m-%d").date()
     except ValueError:
@@ -180,6 +171,71 @@ async def search_reroute(
         response["ai_summary"] = summarize_reroute(origin, destination, travel_date, results)
 
     return response
+
+
+@app.get("/search/natural", dependencies=[Depends(require_api_key)])
+@limiter.limit("5/minute")
+async def search_natural(
+    request: Request,
+    query: str = Query(..., description="Free-text travel request, e.g. 'student flying Gujarat to Toronto 31 aug to 2 sep'"),
+):
+    """
+    Takes one free-form sentence, extracts origin/destination/dates via
+    Groq, resolves them to real airport codes and dates, then runs the
+    same reroute search as /search/reroute. If anything's missing or
+    unclear, returns a clarification request instead of guessing.
+    """
+    intent = resolve_full_intent(query)
+
+    if not intent["success"]:
+        if "errors" in intent:
+            raise HTTPException(status_code=400, detail=intent["errors"])
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": intent.get("clarification_needed", "Could you provide more details?"),
+                "missing_fields": intent.get("missing_fields", []),
+                "understood_so_far": {
+                    "origin": intent.get("origin"),
+                    "destination": intent.get("destination"),
+                    "start_date": intent.get("start_date"),
+                },
+            },
+        )
+
+    origin = intent["origin"]
+    destination = intent["destination"]
+    travel_date = validate_travel_date(intent["start_date"])
+
+    results, failures = await search_reroute_options(origin, destination, travel_date, DEFAULT_HUBS)
+
+    if not results:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No reroute options found for {origin} -> {destination} on {travel_date}",
+        )
+
+    results.sort(key=lambda r: r["total_price"])
+
+    for option in results:
+        option["leg1"]["student_discounts"] = get_discounts_for_airline(option["leg1"]["airlines"])
+        option["leg2"]["student_discounts"] = get_discounts_for_airline(option["leg2"]["airlines"])
+        option["discounted_total_price"] = (
+            option["leg1"]["discounted_price"] + option["leg2"]["discounted_price"]
+        )
+
+    return {
+        "understood_query": {
+            "origin": origin,
+            "destination": destination,
+            "date": travel_date,
+            "is_student": intent.get("is_student"),
+            "budget": intent.get("budget"),
+            "other_notes": intent.get("other_notes"),
+        },
+        "options": results,
+        "failed_hubs": [f["hub"] for f in failures],
+    }
 
 
 @app.get("/discounts/student", dependencies=[Depends(require_api_key)])
