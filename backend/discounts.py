@@ -59,15 +59,22 @@ def get_all_discounts():
     return STUDENT_DISCOUNTS
 
 
-def get_discounts_for_airline(airline_name: str):
+def get_discounts_for_airline(airline_name):
     """
     Returns any student discount programs applicable to a given airline name.
     Matching is case-insensitive and does a partial match, since airline
     names from fast-flights results may include extra text (e.g. flight
     numbers or codeshare info).
+
+    airline_name can be a single string OR a list of strings (fast-flights
+    returns a list when a flight involves multiple airlines, e.g. codeshares
+    or connecting itineraries) -- normalize to one string either way.
     """
     if not airline_name:
         return []
+
+    if isinstance(airline_name, list):
+        airline_name = " ".join(airline_name)
 
     airline_lower = airline_name.lower()
     matches = []
@@ -81,7 +88,7 @@ def get_discounts_for_airline(airline_name: str):
     return matches
 
 
-def get_best_price_discount(airline_name: str, price: int):
+def get_best_price_discount(airline_name, price: int):
     """
     Finds the best applicable *percentage* discount for an airline and
     computes the resulting discounted price. Extra_baggage-type discounts
@@ -97,7 +104,6 @@ def get_best_price_discount(airline_name: str, price: int):
     if not percentage_programs:
         return price, None
 
-    # pick the single best (highest %) discount rather than stacking multiple
     best = max(percentage_programs, key=lambda p: p["discount_value"])
     discounted_price = round(price * (1 - best["discount_value"] / 100))
 
