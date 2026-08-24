@@ -28,6 +28,7 @@ from cache import reroute_cache
 from discounts import get_all_discounts, get_discounts_for_airline
 from ai_summary import summarize_reroute
 from nlp_intent import resolve_full_intent
+from recommendations import predict_price_range, predict_price_trend, score_buy_now_vs_wait
 
 app = FastAPI(title="Flight Reroute + Student Fares API")
 
@@ -236,6 +237,52 @@ async def search_natural(
         "options": results,
         "failed_hubs": [f["hub"] for f in failures],
     }
+
+
+@app.get("/search/recommend", dependencies=[Depends(require_api_key)])
+def search_recommend(
+    airline: str = Query(..., description="Airline name, e.g. Vistara"),
+    source_city: str = Query(..., description="Source city, e.g. Delhi"),
+    departure_time: str = Query(..., description="e.g. Morning, Evening"),
+    stops: str = Query(..., description="e.g. zero, one"),
+    arrival_time: str = Query(..., description="e.g. Morning, Evening"),
+    destination_city: str = Query(..., description="Destination city, e.g. Mumbai"),
+    travel_class: str = Query(..., description="Economy or Business"),
+    duration: float = Query(..., description="Flight duration in hours"),
+    days_left: int = Query(..., description="Days before departure"),
+    current_price: int = Query(None, description="Optional: today's actual observed price, for a buy-now-vs-wait signal"),
+):
+    """
+    Predicts a price range for this flight based on the booking window
+    (days_left), trained on real historical Indian domestic fare data.
+
+    CAVEAT: trained on domestic routes only -- for international routes,
+    treat this as a general approximation of booking-window behavior, not
+    a precise forecast, until retrained on our own scraped route history.
+
+    If current_price is provided, also returns a buy-now-vs-wait signal
+    comparing that real price against the model's predicted range.
+    """
+    predicted_range = predict_price_range(
+        airline, source_city, departure_time, stops,
+        arrival_time, destination_city, travel_class, duration, days_left
+    )
+
+    trend = predict_price_trend(
+        airline, source_city, departure_time, stops,
+        arrival_time, destination_city, travel_class, duration
+    )
+
+    response = {
+        "predicted_range": predicted_range,
+        "price_trend_by_days_left": trend,
+        "caveat": "Model trained on Indian domestic flight data; treat as a general approximation for international routes.",
+    }
+
+    if current_price is not None:
+        response["buy_now_vs_wait"] = score_buy_now_vs_wait(current_price, predicted_range)
+
+    return response
 
 
 @app.get("/discounts/student", dependencies=[Depends(require_api_key)])
