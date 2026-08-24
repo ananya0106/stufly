@@ -1,28 +1,33 @@
 from cache import reroute_cache
 from discounts import get_best_price_discount
 import asyncio
+import os
 from datetime import datetime
 
 from fast_flights import FlightQuery, Passengers, create_query, get_flights
 from fast_flights.exceptions import FlightsNotFound
+from fast_flights.integrations import SearchApi
 
 """
 flights.py
 -----------
 Thin wrapper around the fast-flights library.
 
-Why a separate file: main.py (our API layer) should never talk to
-fast-flights directly. If fast-flights changes its internals again,
-we only fix this one file instead of hunting through every endpoint.
-
-NOTE ON VERSIONS: fast-flights has changed its API before (older docs
-export FlightData/get_flights(flight_data=...), but v3.0.2 -- what
-actually installs today -- exports FlightQuery + create_query() instead).
-Always check with
-    python3 -c "import fast_flights; print(dir(fast_flights))"
-before trusting any tutorial, including this one, if pip installs a
-different version later.
+Uses the SearchApi integration (a real, paid API) instead of raw scraping.
+Why: direct scraping gets IP-blocked reliably on cloud hosts (Railway,
+AWS, etc.) since Google flags datacenter IPs -- confirmed by our own
+deployment. SearchApi routes through a legitimate paid channel, so it
+doesn't hit that wall. Requires SEARCHAPI_KEY in .env / Railway variables.
 """
+
+_searchapi_client = None
+
+
+def _get_searchapi():
+    global _searchapi_client
+    if _searchapi_client is None:
+        _searchapi_client = SearchApi(api_key=os.getenv("SEARCHAPI_KEY"))
+    return _searchapi_client
 
 
 def search_direct_flight(origin: str, destination: str, travel_date: str):
@@ -52,27 +57,26 @@ def search_direct_flight(origin: str, destination: str, travel_date: str):
     )
 
     try:
-        results = get_flights(query)
+        results = get_flights(query, integration=_get_searchapi())
     except FlightsNotFound:
         return None
     except Exception as e:
-        # fast-flights is a scraper, not an official API -- Google can serve
-        # a different page layout, a CAPTCHA, or a blocked response, and the
-        # library will fail to parse it. We don't want that to crash our
-        # whole endpoint, so we catch broadly here and log what happened.
-        # If you see this a lot, try fetch_mode differences or add delays
-        # between requests (see fast-flights README on rate limiting).
-        print(f"[fast-flights error] {origin}->{destination} on {travel_date}: {e}")
+        print(f"[flights error] {origin}->{destination} on {travel_date}: {e}")
         return None
 
     if not results:
         return None
 
-    # results is a list of "Flights" entries (each can itself represent
-    # a multi-leg option), already effectively sorted with cheapest/best
-    # first by Google's own ranking. We take the first as "the" direct price.
-    best = results[0]
-    leg = best.flights[0]  # the first physical flight segment
+    # SearchApi's Result object may expose flights differently than the raw
+    # scraper (a .flights attribute vs a plain list) -- handle both shapes
+    # rather than assuming one, since we've seen this vary.
+    flight_list = getattr(results, "flights", results)
+
+    if not flight_list:
+        return None
+
+    best = flight_list[0]
+    leg = best.flights[0] if hasattr(best, "flights") else best
 
     discounted_price, applied_discount = get_best_price_discount(best.airlines, best.price)
 
@@ -81,12 +85,12 @@ def search_direct_flight(origin: str, destination: str, travel_date: str):
         "destination": destination,
         "date": travel_date,
         "airlines": best.airlines,
-        "price": best.price,  # original price, e.g. 45231
-        "discounted_price": discounted_price,  # after best student % discount, same as price if none applies
-        "applied_discount": applied_discount,  # the specific program used, or None
-        "duration_minutes": leg.duration,
-        "plane_type": leg.plane_type,
-        "num_legs": len(best.flights),  # >1 means it's a connecting flight
+        "price": best.price,
+        "discounted_price": discounted_price,
+        "applied_discount": applied_discount,
+        "duration_minutes": getattr(leg, "duration", None),
+        "plane_type": getattr(leg, "plane_type", None),
+        "num_legs": len(best.flights) if hasattr(best, "flights") else 1,
     }
 
 
@@ -101,9 +105,8 @@ async def _search_hub(
 ):
     """
     Checks one hub: origin -> hub -> destination.
-    Retries transient failures (network blips, rate limits) up to
-    max_retries times with a short backoff, and caps each attempt
-    with a timeout so one stuck hub can't stall the whole batch.
+    Retries transient failures up to max_retries times with backoff,
+    and caps each attempt with a timeout.
     """
     async with semaphore:
         last_error = None
@@ -127,8 +130,6 @@ async def _search_hub(
                         "total_price": leg1["price"] + leg2["price"],
                     }
 
-                # got a clean response but no flights exist on this route --
-                # not a transient error, retrying won't help, so stop here
                 return {
                     "hub": hub,
                     "error": "no_results",
@@ -140,13 +141,10 @@ async def _search_hub(
             except Exception as e:
                 last_error = str(e)
 
-            # a real failure happened -- back off before retrying,
-            # unless this was the last attempt
             if attempt < max_retries:
                 print(f"[reroute] hub={hub} attempt {attempt} failed ({last_error}), retrying...")
-                await asyncio.sleep(2 * attempt)  # 2s, then 4s, etc.
+                await asyncio.sleep(2 * attempt)
 
-        # all retries exhausted
         return {
             "hub": hub,
             "error": last_error,
@@ -167,7 +165,7 @@ async def search_reroute_options(origin: str, destination: str, travel_date: str
 
     print(f"[cache] miss for {origin}-{destination}-{travel_date}, scraping...")
 
-    semaphore = asyncio.Semaphore(3)  # cap concurrent hub checks so we don't hammer the scraper
+    semaphore = asyncio.Semaphore(3)
     tasks = [_search_hub(origin, destination, travel_date, hub, semaphore) for hub in hubs]
     raw_results = await asyncio.gather(*tasks)
 
