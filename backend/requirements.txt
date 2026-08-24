@@ -4,3 +4,4 @@ fast-flights
 groq
 slowapi
 python-dotenv
+dateparser
