@@ -5,3 +5,6 @@ groq
 slowapi
 python-dotenv
 dateparser
+joblib
+scikit-learn
+numpy
