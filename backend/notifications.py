@@ -1,9 +1,6 @@
 import os
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+import base64
+import resend
 from datetime import datetime, date, timedelta
 
 import psycopg2
@@ -33,8 +30,16 @@ from discounts import get_discounts_for_airline
 # blocks it calls.
 
 _DATABASE_URL = os.getenv("DATABASE_URL")
-_GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
-_GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+_RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+
+# Resend, not raw SMTP -- Railway's cheaper plans block outbound SMTP
+# entirely (ports 25/465/587/2525), as an anti-spam measure. Resend sends
+# over a normal HTTPS request instead, which is never blocked, and it's
+# free for the volume we're sending at. The email's actual content --
+# subject, HTML body, Excel attachment -- is identical either way; only
+# the delivery mechanism changed.
+if _RESEND_API_KEY:
+    resend.api_key = _RESEND_API_KEY
 
 # Colours pulled straight from the frontend's palette, so a tracker report
 # and the website itself feel like the same product rather than a plain
@@ -324,9 +329,8 @@ def _build_report_excel(tracker: dict, history: list[dict], filepath: str):
 
 def _build_html_email(tracker: dict, history: list[dict], best_price, best_airline, best_date) -> str:
     """
-    Builds the styled HTML email body -- this replicates the preview we
-    designed and approved earlier, just filled in with real numbers from
-    this specific tracker instead of mock data.
+    Builds the styled HTML email body -- replicates the preview design,
+    filled in with real numbers from this specific tracker.
     """
     origin, destination = tracker["origin"], tracker["destination"]
     airlines = tracker["airlines"].split(",")
@@ -400,16 +404,19 @@ def _build_html_email(tracker: dict, history: list[dict], best_price, best_airli
 
 def send_tracker_report(tracker: dict):
     """
-    Puts together the finished report and emails it -- this is where a
-    tracker's whole story comes together: pull the recorded history, build
-    the spreadsheet, build the styled HTML email around it, and send both.
+    Puts together the finished report and emails it via Resend's API.
+    Pulls the recorded history, builds the spreadsheet, builds the styled
+    HTML email around it, and sends both in one request.
 
-    If Gmail isn't configured, we log and quietly skip rather than
+    Resend, not raw SMTP -- Railway's cheaper plans block outbound SMTP
+    entirely, so a normal HTTPS API call is what actually gets through.
+
+    If Resend isn't configured, we log and quietly skip rather than
     crashing the poller -- a missing email credential shouldn't take down
     the whole background price-tracking process.
     """
-    if not _GMAIL_ADDRESS or not _GMAIL_APP_PASSWORD:
-        print(f"[notifications] Gmail not configured -- skipping report for tracker {tracker['id']}")
+    if not _RESEND_API_KEY:
+        print(f"[notifications] Resend not configured -- skipping report for tracker {tracker['id']}")
         return False
 
     history = get_tracker_history(tracker["id"])
@@ -424,29 +431,20 @@ def send_tracker_report(tracker: dict):
     subject = f"Your {tracker['origin']} to {tracker['destination']} tracker: results are in"
     html_body = _build_html_email(tracker, history, best_price, best_airline, best_date)
 
-    msg = MIMEMultipart("mixed")
-    msg["Subject"] = subject
-    msg["From"] = f"Stufly Price Alerts <{_GMAIL_ADDRESS}>"
-    msg["To"] = tracker["email"]
-
-    # Attach the HTML body as its own "alternative" part -- some email
-    # clients don't render HTML, so this is the standard way to give
-    # them a real body instead of a blank email. We don't bother with a
-    # separate plain-text fallback here since the HTML is simple enough
-    # that every modern client renders it fine.
-    msg.attach(MIMEText(html_body, "html"))
-
     with open(filepath, "rb") as f:
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(f.read())
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition", f"attachment; filename=stufly_tracker_{tracker['origin']}_{tracker['destination']}.xlsx")
-    msg.attach(part)
+        attachment_content = base64.b64encode(f.read()).decode("utf-8")
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(_GMAIL_ADDRESS, _GMAIL_APP_PASSWORD)
-            server.sendmail(_GMAIL_ADDRESS, [tracker["email"]], msg.as_string())
+        resend.Emails.send({
+            "from": "Stufly Price Alerts <alerts@resend.dev>",
+            "to": [tracker["email"]],
+            "subject": subject,
+            "html": html_body,
+            "attachments": [{
+                "filename": f"stufly_tracker_{tracker['origin']}_{tracker['destination']}.xlsx",
+                "content": attachment_content,
+            }],
+        })
         print(f"[notifications] Sent tracker report to {tracker['email']} for tracker {tracker['id']}")
         return True
     except Exception as e:
