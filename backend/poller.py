@@ -2,40 +2,26 @@
 poller.py
 ----------
 Background price-tracking script. Runs continuously, checking a fixed
-list of routes on a timer, independent of any user activity. This is
-what actually builds real price history over time -- the data
-recommendations.py needs for genuine buy-now-vs-wait signals.
+list of routes on a timer, independent of any user activity. Saves to
+Postgres (via price_history.py) so history survives restarts.
 
 Run this as its own long-running process (a separate Railway service),
-NOT as part of the main API server -- keeps the API responsive and the
-polling schedule independent of web traffic.
+NOT as part of the main API server.
 """
 import asyncio
 from datetime import datetime
 
 from flights import search_direct_flight
-from price_history import save_price
+from price_history import save_price, init_db
 
-# Routes to track. Start small and expand once this is confirmed working --
-# each route adds real scraping load, and fast-flights is not built for
-# high request volume.
 TRACKED_ROUTES = [
-    ("DEL", "YYZ"),  # Delhi -> Toronto
-    ("BOM", "YVR"),  # Mumbai -> Vancouver
-    ("DEL", "YUL"),  # Delhi -> Montreal
-    ("BOM", "YYZ"),  # Mumbai -> Toronto
+    ("DEL", "YYZ"),
+    ("BOM", "YVR"),
+    ("DEL", "YUL"),
+    ("BOM", "YYZ"),
 ]
 
-# How often to check each route, in seconds. 3 hours = 10800 seconds.
-# Chosen to catch same-day price swings (like a sudden Emirates promo)
-# without hammering the scraper -- fast-flights is not an official API
-# and aggressive polling risks getting blocked.
 POLL_INTERVAL_SECONDS = 3 * 60 * 60
-
-# How many days ahead to check prices for. A fixed offset (e.g. 60 days
-# out) keeps the comparison consistent across polls -- checking "today's
-# date" would mean the days_left value keeps shifting, making price
-# history harder to compare apples-to-apples.
 DAYS_AHEAD = 60
 
 
@@ -63,7 +49,6 @@ async def poll_once():
         except Exception as e:
             print(f"[poller] {origin}->{destination} failed: {e}")
 
-        # small delay between routes so we're not firing requests back-to-back
         await asyncio.sleep(5)
 
     print(f"[poller] Poll cycle complete.")
@@ -71,6 +56,7 @@ async def poll_once():
 
 async def run_forever():
     """Main loop: poll, sleep, repeat, forever."""
+    init_db()
     print(f"[poller] Starting background price poller.")
     print(f"[poller] Tracking {len(TRACKED_ROUTES)} routes, checking every {POLL_INTERVAL_SECONDS // 3600} hours.")
 

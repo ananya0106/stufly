@@ -29,8 +29,11 @@ from discounts import get_all_discounts, get_discounts_for_airline
 from ai_summary import summarize_reroute
 from nlp_intent import resolve_full_intent
 from recommendations import predict_price_range, predict_price_trend, score_buy_now_vs_wait
+from price_history import init_db
 
 app = FastAPI(title="Flight Reroute + Student Fares API")
+
+init_db()
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter

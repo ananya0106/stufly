@@ -8,3 +8,4 @@ dateparser
 joblib
 scikit-learn
 numpy
+psycopg2-binary
