@@ -47,6 +47,7 @@ app.add_middleware(
 )
 
 DEFAULT_HUBS = ["DEL", "BOM", "DXB", "DOH", "IST"]
+VALID_SEAT_CLASSES = ["economy", "premium-economy", "business", "first"]
 
 ENV = os.getenv("ENV", "production")
 API_KEY = os.getenv("API_KEY")
@@ -86,6 +87,17 @@ def validate_travel_date(travel_date: str) -> str:
     return travel_date
 
 
+def validate_seat_class(seat_class: str) -> str:
+    """Confirms seat_class is one fast-flights actually supports."""
+    seat_class = seat_class.lower()
+    if seat_class not in VALID_SEAT_CLASSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid seat_class '{seat_class}' -- must be one of {VALID_SEAT_CLASSES}",
+        )
+    return seat_class
+
+
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Flight API is running"}
@@ -98,21 +110,23 @@ def search_direct(
     origin: str = Query(..., min_length=3, max_length=3, description="e.g. BOM"),
     destination: str = Query(..., min_length=3, max_length=3, description="e.g. YYZ"),
     travel_date: str = Query(..., description="YYYY-MM-DD"),
+    seat_class: str = Query("economy", description="economy, premium-economy, business, or first"),
 ):
     """
-    Returns the cheapest direct flight for a given route + date, including
-    original price, discounted_price (after best student % discount), and
-    matching student discount programs for the airline.
+    Returns the cheapest direct flight for a given route + date + cabin class,
+    including original price, discounted_price (after best student % discount),
+    and matching student discount programs for the airline.
     """
     origin = origin.upper()
     destination = destination.upper()
     travel_date = validate_travel_date(travel_date)
+    seat_class = validate_seat_class(seat_class)
 
-    result = search_direct_flight(origin, destination, travel_date)
+    result = search_direct_flight(origin, destination, travel_date, seat_class)
     if result is None:
         raise HTTPException(
             status_code=404,
-            detail=f"No flights found for {origin} -> {destination} on {travel_date}",
+            detail=f"No flights found for {origin} -> {destination} on {travel_date} ({seat_class})",
         )
 
     result["student_discounts"] = get_discounts_for_airline(result["airlines"])
@@ -127,24 +141,27 @@ async def search_reroute(
     origin: str = Query(..., min_length=3, max_length=3, description="e.g. BOM"),
     destination: str = Query(..., min_length=3, max_length=3, description="e.g. YYZ"),
     travel_date: str = Query(..., description="YYYY-MM-DD"),
+    seat_class: str = Query("economy", description="economy, premium-economy, business, or first"),
     include_summary: bool = Query(False, description="If true, adds an AI-generated plain-English summary"),
 ):
     """
     Checks candidate hub airports for a cheaper origin->hub->destination
-    routing than flying direct. Cached per (origin, destination, date) for
-    an hour; hub checks run concurrently with retries and timeouts; each
-    leg is annotated with student discounts and a discounted price.
+    routing than flying direct, for the given cabin class. Cached per
+    (origin, destination, date, seat_class) for an hour; hub checks run
+    concurrently with retries and timeouts; each leg is annotated with
+    student discounts and a discounted price.
     """
     origin = origin.upper()
     destination = destination.upper()
     travel_date = validate_travel_date(travel_date)
+    seat_class = validate_seat_class(seat_class)
 
-    results, failures = await search_reroute_options(origin, destination, travel_date, DEFAULT_HUBS)
+    results, failures = await search_reroute_options(origin, destination, travel_date, DEFAULT_HUBS, seat_class)
 
     if not results:
         raise HTTPException(
             status_code=404,
-            detail=f"No reroute options found for {origin} -> {destination} on {travel_date} "
+            detail=f"No reroute options found for {origin} -> {destination} on {travel_date} ({seat_class}) "
                    f"({len(failures)} of {len(DEFAULT_HUBS)} hubs failed)",
         )
 
@@ -161,6 +178,7 @@ async def search_reroute(
         "origin": origin,
         "destination": destination,
         "date": travel_date,
+        "seat_class": seat_class,
         "options": results,
         "failed_hubs": [f["hub"] for f in failures],
     }
@@ -186,8 +204,7 @@ async def search_natural(
     """
     Takes one free-form sentence, extracts origin/destination/dates via
     Groq, resolves them to real airport codes and dates, then runs the
-    same reroute search as /search/reroute. If anything's missing or
-    unclear, returns a clarification request instead of guessing.
+    same reroute search as /search/reroute (economy class by default).
     """
     intent = resolve_full_intent(query)
 
@@ -250,7 +267,7 @@ def search_recommend(
     stops: str = Query(..., description="e.g. zero, one"),
     arrival_time: str = Query(..., description="e.g. Morning, Evening"),
     destination_city: str = Query(..., description="Destination city, e.g. Mumbai"),
-    travel_class: str = Query(..., description="Economy or Business"),
+    travel_class: str = Query(..., description="Economy or Business (model only supports these two)"),
     duration: float = Query(..., description="Flight duration in hours"),
     days_left: int = Query(..., description="Days before departure"),
     current_price: int = Query(None, description="Optional: today's actual observed price, for a buy-now-vs-wait signal"),
@@ -259,13 +276,21 @@ def search_recommend(
     Predicts a price range for this flight based on the booking window
     (days_left), trained on real historical Indian domestic fare data.
 
-    CAVEAT: trained on domestic routes only -- for international routes,
-    treat this as a general approximation of booking-window behavior, not
-    a precise forecast, until retrained on our own scraped route history.
+    CAVEAT: the trained model only has Economy and Business classes
+    (that's all the training dataset contained) -- Premium Economy and
+    First are not supported by this endpoint. Also domestic-route data
+    only; treat as a general approximation for international routes.
 
     If current_price is provided, also returns a buy-now-vs-wait signal
     comparing that real price against the model's predicted range.
     """
+    if travel_class not in ("Economy", "Business"):
+        raise HTTPException(
+            status_code=400,
+            detail="The forecasting model only supports travel_class 'Economy' or 'Business' "
+                   "(the training dataset didn't include Premium Economy or First class).",
+        )
+
     predicted_range = predict_price_range(
         airline, source_city, departure_time, stops,
         arrival_time, destination_city, travel_class, duration, days_left
@@ -279,7 +304,7 @@ def search_recommend(
     response = {
         "predicted_range": predicted_range,
         "price_trend_by_days_left": trend,
-        "caveat": "Model trained on Indian domestic flight data; treat as a general approximation for international routes.",
+        "caveat": "Model trained on Indian domestic flight data (Economy/Business only); treat as a general approximation for international routes.",
     }
 
     if current_price is not None:

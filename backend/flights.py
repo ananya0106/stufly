@@ -18,6 +18,9 @@ Why: direct scraping gets IP-blocked reliably on cloud hosts (Railway,
 AWS, etc.) since Google flags datacenter IPs -- confirmed by our own
 deployment. SearchApi routes through a legitimate paid channel, so it
 doesn't hit that wall. Requires SEARCHAPI_KEY in .env / Railway variables.
+
+seat_class supports: "economy", "premium-economy", "business", "first"
+(matches fast-flights' seat parameter options).
 """
 
 _searchapi_client = None
@@ -30,7 +33,7 @@ def _get_searchapi():
     return _searchapi_client
 
 
-def search_direct_flight(origin: str, destination: str, travel_date: str):
+def search_direct_flight(origin: str, destination: str, travel_date: str, seat_class: str = "economy"):
     """
     Search for a one-way flight between two airports on a given date.
 
@@ -38,6 +41,7 @@ def search_direct_flight(origin: str, destination: str, travel_date: str):
         origin: 3-letter IATA airport code, e.g. "BOM" (Mumbai)
         destination: 3-letter IATA airport code, e.g. "YYZ" (Toronto)
         travel_date: date string in "YYYY-MM-DD" format
+        seat_class: "economy", "premium-economy", "business", or "first"
 
     Returns:
         A plain dict (not the raw fast-flights object) so it's easy to
@@ -49,7 +53,7 @@ def search_direct_flight(origin: str, destination: str, travel_date: str):
             FlightQuery(date=travel_date, from_airport=origin, to_airport=destination)
         ],
         trip="one-way",
-        seat="economy",
+        seat=seat_class,
         passengers=Passengers(
             adults=1, children=0, infants_in_seat=0, infants_on_lap=0
         ),
@@ -61,15 +65,12 @@ def search_direct_flight(origin: str, destination: str, travel_date: str):
     except FlightsNotFound:
         return None
     except Exception as e:
-        print(f"[flights error] {origin}->{destination} on {travel_date}: {e}")
+        print(f"[flights error] {origin}->{destination} on {travel_date} ({seat_class}): {e}")
         return None
 
     if not results:
         return None
 
-    # SearchApi's Result object may expose flights differently than the raw
-    # scraper (a .flights attribute vs a plain list) -- handle both shapes
-    # rather than assuming one, since we've seen this vary.
     flight_list = getattr(results, "flights", results)
 
     if not flight_list:
@@ -84,6 +85,7 @@ def search_direct_flight(origin: str, destination: str, travel_date: str):
         "origin": origin,
         "destination": destination,
         "date": travel_date,
+        "seat_class": seat_class,
         "airlines": best.airlines,
         "price": best.price,
         "discounted_price": discounted_price,
@@ -100,6 +102,7 @@ async def _search_hub(
     travel_date: str,
     hub: str,
     semaphore: asyncio.Semaphore,
+    seat_class: str = "economy",
     max_retries: int = 2,
     timeout_seconds: int = 20,
 ):
@@ -114,11 +117,11 @@ async def _search_hub(
         for attempt in range(1, max_retries + 1):
             try:
                 leg1 = await asyncio.wait_for(
-                    asyncio.to_thread(search_direct_flight, origin, hub, travel_date),
+                    asyncio.to_thread(search_direct_flight, origin, hub, travel_date, seat_class),
                     timeout=timeout_seconds,
                 )
                 leg2 = await asyncio.wait_for(
-                    asyncio.to_thread(search_direct_flight, hub, destination, travel_date),
+                    asyncio.to_thread(search_direct_flight, hub, destination, travel_date, seat_class),
                     timeout=timeout_seconds,
                 )
 
@@ -152,21 +155,22 @@ async def _search_hub(
         }
 
 
-async def search_reroute_options(origin: str, destination: str, travel_date: str, hubs: list[str]):
+async def search_reroute_options(origin: str, destination: str, travel_date: str, hubs: list[str], seat_class: str = "economy"):
     """
     Checks a list of candidate hub airports for a cheaper origin->hub->destination
     routing than a direct flight. Runs hub checks concurrently (capped at 3 at once)
-    and caches results per (origin, destination, date) for an hour.
+    and caches results per (origin, destination, date, seat_class) for an hour.
     """
-    cached = reroute_cache.get(origin, destination, travel_date)
+    cache_key_date = f"{travel_date}-{seat_class}"
+    cached = reroute_cache.get(origin, destination, cache_key_date)
     if cached is not None:
-        print(f"[cache] hit for {origin}-{destination}-{travel_date}")
+        print(f"[cache] hit for {origin}-{destination}-{cache_key_date}")
         return cached["results"], cached["failures"]
 
-    print(f"[cache] miss for {origin}-{destination}-{travel_date}, scraping...")
+    print(f"[cache] miss for {origin}-{destination}-{cache_key_date}, scraping...")
 
     semaphore = asyncio.Semaphore(3)
-    tasks = [_search_hub(origin, destination, travel_date, hub, semaphore) for hub in hubs]
+    tasks = [_search_hub(origin, destination, travel_date, hub, semaphore, seat_class) for hub in hubs]
     raw_results = await asyncio.gather(*tasks)
 
     results = [r for r in raw_results if r and "error" not in r]
@@ -178,7 +182,7 @@ async def search_reroute_options(origin: str, destination: str, travel_date: str
             print(f"  - {f['timestamp']} | hub={f['hub']} | error={f['error']}")
 
     if results:
-        reroute_cache.set(origin, destination, travel_date, {
+        reroute_cache.set(origin, destination, cache_key_date, {
             "results": results,
             "failures": failures,
         })
