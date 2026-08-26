@@ -2,9 +2,7 @@
 price_history.py
 -----------------
 Storage interface for tracked flight prices over time, backed by
-Postgres (Railway-managed). Persists across restarts, unlike the
-earlier in-memory version -- this is what lets the poller actually
-build real history over days/weeks instead of resetting constantly.
+Postgres (Railway-managed). Persists across restarts.
 """
 import os
 import psycopg2
@@ -28,54 +26,61 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     origin TEXT NOT NULL,
                     destination TEXT NOT NULL,
+                    seat_class TEXT NOT NULL DEFAULT 'economy',
                     price INTEGER NOT NULL,
                     timestamp TIMESTAMPTZ NOT NULL
                 )
             """)
+            # Handle upgrading an existing table that predates seat_class
+            cur.execute("""
+                ALTER TABLE price_history
+                ADD COLUMN IF NOT EXISTS seat_class TEXT NOT NULL DEFAULT 'economy'
+            """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_route
-                ON price_history (origin, destination)
+                ON price_history (origin, destination, seat_class)
             """)
         conn.commit()
     finally:
         conn.close()
 
 
-def save_price(origin: str, destination: str, price: int):
-    """Records one observed price point for a route, right now."""
+def save_price(origin: str, destination: str, price: int, seat_class: str = "economy"):
+    """Records one observed price point for a route + cabin class, right now."""
     conn = _get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO price_history (origin, destination, price, timestamp) VALUES (%s, %s, %s, %s)",
-                (origin, destination, price, datetime.now()),
+                "INSERT INTO price_history (origin, destination, seat_class, price, timestamp) VALUES (%s, %s, %s, %s, %s)",
+                (origin, destination, seat_class, price, datetime.now()),
             )
         conn.commit()
     finally:
         conn.close()
 
 
-def get_recent_prices(origin: str, destination: str, limit: int = 30) -> list[dict]:
-    """Returns the most recent recorded price points for a route, oldest to newest."""
+def get_recent_prices(origin: str, destination: str, seat_class: str = "economy", limit: int = 30) -> list[dict]:
+    """Returns the most recent recorded price points for a route + cabin class, oldest to newest."""
     conn = _get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT origin, destination, price, timestamp
+                SELECT origin, destination, seat_class, price, timestamp
                 FROM price_history
-                WHERE origin = %s AND destination = %s
+                WHERE origin = %s AND destination = %s AND seat_class = %s
                 ORDER BY timestamp DESC
                 LIMIT %s
                 """,
-                (origin, destination, limit),
+                (origin, destination, seat_class, limit),
             )
             rows = cur.fetchall()
-        rows.reverse()  # oldest to newest
+        rows.reverse()
         return [
             {
                 "origin": r["origin"],
                 "destination": r["destination"],
+                "seat_class": r["seat_class"],
                 "price": r["price"],
                 "timestamp": r["timestamp"].isoformat(timespec="seconds"),
             }
@@ -85,14 +90,14 @@ def get_recent_prices(origin: str, destination: str, limit: int = 30) -> list[di
         conn.close()
 
 
-def price_history_size(origin: str, destination: str) -> int:
-    """How many price points we've collected for this route so far."""
+def price_history_size(origin: str, destination: str, seat_class: str = "economy") -> int:
+    """How many price points we've collected for this route + cabin class so far."""
     conn = _get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT COUNT(*) FROM price_history WHERE origin = %s AND destination = %s",
-                (origin, destination),
+                "SELECT COUNT(*) FROM price_history WHERE origin = %s AND destination = %s AND seat_class = %s",
+                (origin, destination, seat_class),
             )
             return cur.fetchone()[0]
     finally:
