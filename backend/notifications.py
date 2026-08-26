@@ -38,7 +38,7 @@ _GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 # Colours pulled straight from the frontend's palette, so a tracker report
 # and the website itself feel like the same product rather than a plain
-# spreadsheet bolted on the side.
+# spreadsheet (or plain email) bolted on the side.
 NAVY = "14213D"
 GOLD = "C98F1F"
 CREAM = "FDF8F0"
@@ -55,9 +55,7 @@ def init_notifications_db():
     """
     Creates both tracker tables if they don't already exist. Safe to call
     every time the app starts -- CREATE TABLE IF NOT EXISTS just does
-    nothing on the second and every later run, so there's no harm in
-    calling this on every boot rather than trying to remember whether it's
-    already been done.
+    nothing on the second and every later run.
     """
     conn = _get_connection()
     try:
@@ -92,15 +90,7 @@ def init_notifications_db():
 
 
 def create_tracker(email: str, origin: str, destination: str, airlines: list[str], duration_days: int, seat_class: str = "economy") -> int:
-    """
-    Registers a new tracker. airlines gets stored as a comma-joined string
-    rather than its own table, mainly because there are only ever 2-3 of
-    them per tracker -- a full join table would be over-engineering for
-    something this small.
-
-    Returns the new tracker's id, so the endpoint that calls this can hand
-    it back to the person as a confirmation ("your tracker id is 42").
-    """
+    """Registers a new tracker and returns its id."""
     conn = _get_connection()
     try:
         with conn.cursor() as cur:
@@ -120,13 +110,7 @@ def create_tracker(email: str, origin: str, destination: str, airlines: list[str
 
 
 def get_due_trackers() -> list[dict]:
-    """
-    A tracker is "due" for a check today if it's still active and today's
-    date falls somewhere inside its tracking window. We check whether
-    today's row already exists for this tracker further down (in
-    check_trackers_today), rather than here -- this function's only job is
-    finding which trackers are relevant today at all.
-    """
+    """Trackers that are still active and inside their tracking window today."""
     conn = _get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -145,13 +129,7 @@ def get_due_trackers() -> list[dict]:
 
 
 def get_trackers_ready_to_close() -> list[dict]:
-    """
-    Once a tracker's window has fully passed, it's time to send the final
-    report and mark it done. Kept separate from get_due_trackers() above
-    because "still collecting data" and "time to send the report" are
-    genuinely different moments in a tracker's life, even though they're
-    both just date comparisons against the same window.
-    """
+    """Trackers whose window has fully passed -- time to send the report."""
     conn = _get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -169,12 +147,8 @@ def get_trackers_ready_to_close() -> list[dict]:
 
 
 def has_checked_today(tracker_id: int) -> bool:
-    """
-    The poller runs every 6 hours, but a tracker only needs one price
-    point per day -- without this check we'd end up with 4 rows for the
-    same day instead of 1, which would throw off the "cheapest day" logic
-    later. This is what stops that from happening.
-    """
+    """Stops the poller (which runs every 6 hours) from writing 4 rows for
+    the same day instead of 1."""
     conn = _get_connection()
     try:
         with conn.cursor() as cur:
@@ -188,13 +162,7 @@ def has_checked_today(tracker_id: int) -> bool:
 
 
 def save_tracker_day(tracker_id: int, prices_by_airline: dict):
-    """
-    Saves one day's worth of prices for a tracker -- one row per airline.
-    ON CONFLICT DO NOTHING means if this somehow got called twice for the
-    same tracker/day/airline, the second call just silently does nothing
-    rather than erroring out or overwriting real data with a possibly
-    worse second reading.
-    """
+    """Saves one day's worth of prices for a tracker, one row per airline."""
     conn = _get_connection()
     try:
         with conn.cursor() as cur:
@@ -213,8 +181,7 @@ def save_tracker_day(tracker_id: int, prices_by_airline: dict):
 
 
 def get_tracker_history(tracker_id: int) -> list[dict]:
-    """Every price point recorded for a tracker, oldest day first -- this is
-    exactly the data the Excel report gets built from."""
+    """Every price point recorded for a tracker, oldest day first."""
     conn = _get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -228,8 +195,7 @@ def get_tracker_history(tracker_id: int) -> list[dict]:
 
 
 def close_tracker(tracker_id: int):
-    """Marks a tracker inactive once its report's been sent, so it doesn't
-    get picked up again by get_due_trackers() or get_trackers_ready_to_close()."""
+    """Marks a tracker inactive once its report's been sent."""
     conn = _get_connection()
     try:
         with conn.cursor() as cur:
@@ -240,31 +206,17 @@ def close_tracker(tracker_id: int):
 
 
 def _build_report_excel(tracker: dict, history: list[dict], filepath: str):
-    """
-    Builds the actual .xlsx report -- two sheets, styled to match Stufly's
-    own colours so this doesn't feel like a generic spreadsheet that
-    happens to have flight numbers in it.
-
-    This whole function is really just following the same layout we
-    mocked up and approved by hand earlier: a Summary sheet with the
-    headline numbers, and a Daily Prices sheet with the full day-by-day
-    breakdown, a student-discount column, and a couple of booking links
-    at the bottom.
-    """
+    """Builds the .xlsx report -- Summary + Daily Prices sheets, styled to
+    match Stufly's own colours."""
     airlines = tracker["airlines"].split(",")
     origin, destination = tracker["origin"], tracker["destination"]
 
-    # Reshape the flat list of (date, airline, price) rows into a
-    # date -> {airline: price} lookup, since that's a much easier shape
-    # to build a day-by-day table from than the raw rows.
     by_date = {}
     for row in history:
         d = row["checked_date"]
         by_date.setdefault(d, {})[row["airline"]] = row["price"]
     sorted_dates = sorted(by_date.keys())
 
-    # Work out the overall cheapest price/airline/day across the whole
-    # window -- this is the headline number the Summary sheet leads with.
     best_price, best_airline, best_date = None, None, None
     for d in sorted_dates:
         for airline, price in by_date[d].items():
@@ -273,7 +225,6 @@ def _build_report_excel(tracker: dict, history: list[dict], filepath: str):
 
     wb = openpyxl.Workbook()
 
-    # ---- Summary sheet ----
     ws1 = wb.active
     ws1.title = "Summary"
     ws1.sheet_properties.tabColor = NAVY
@@ -312,7 +263,6 @@ def _build_report_excel(tracker: dict, history: list[dict], filepath: str):
     ws1.column_dimensions["B"].width = 26
     ws1.column_dimensions["D"].width = 30
 
-    # ---- Daily Prices sheet ----
     ws2 = wb.create_sheet("Daily Prices")
     ws2.sheet_properties.tabColor = GOLD
     for row in ws2.iter_rows(min_row=1, max_row=30, min_col=1, max_col=8):
@@ -343,9 +293,6 @@ def _build_report_excel(tracker: dict, history: list[dict], filepath: str):
                 cell.fill = PatternFill("solid", fgColor=SAGE)
                 cell.font = Font(name="Arial", size=10, bold=True, color="2F6B54")
 
-    # A short, honest note on which airlines have a known student discount --
-    # sourced from the same discounts.py the rest of the app uses, so this
-    # never drifts out of sync with what the website itself would show.
     discount_row = 6 + len(sorted_dates)
     ws2[f"B{discount_row}"] = "Student discounts"
     ws2[f"B{discount_row}"].font = Font(name="Arial", size=11, bold=True, color=NAVY)
@@ -375,13 +322,87 @@ def _build_report_excel(tracker: dict, history: list[dict], filepath: str):
     wb.save(filepath)
 
 
+def _build_html_email(tracker: dict, history: list[dict], best_price, best_airline, best_date) -> str:
+    """
+    Builds the styled HTML email body -- this replicates the preview we
+    designed and approved earlier, just filled in with real numbers from
+    this specific tracker instead of mock data.
+    """
+    origin, destination = tracker["origin"], tracker["destination"]
+    airlines = tracker["airlines"].split(",")
+
+    airline_lows = {}
+    for row in history:
+        if row["price"] is None:
+            continue
+        a = row["airline"]
+        if a not in airline_lows or row["price"] < airline_lows[a]["price"]:
+            airline_lows[a] = {"price": row["price"], "date": row["checked_date"]}
+
+    table_rows = ""
+    for airline in airlines:
+        info = airline_lows.get(airline)
+        is_best = info and best_price is not None and info["price"] == best_price
+        row_style = "background:#D9F0E6;font-weight:700;color:#2F6B54;" if is_best else ""
+        price_text = f"Rs {info['price']:,}" if info else "No data"
+        date_text = info["date"].strftime("%d %b") if info else "-"
+        table_rows += f"""
+          <tr style="{row_style}">
+            <td style="padding:9px 12px;border-bottom:1px solid #F0EBDD;">{airline}</td>
+            <td style="padding:9px 12px;border-bottom:1px solid #F0EBDD;text-align:right;font-family:'Courier New',monospace;">{price_text}</td>
+            <td style="padding:9px 12px;border-bottom:1px solid #F0EBDD;">{date_text}</td>
+          </tr>"""
+
+    headline = f"<b style='color:#C98F1F;'>{best_airline}</b> came in cheapest at <b style='color:#C98F1F;'>Rs {best_price:,}</b>, on {best_date.strftime('%d %b')}." if best_price else "We couldn't find prices for these airlines during this window."
+
+    return f"""
+    <!DOCTYPE html><html><body style="margin:0;padding:0;background:#E8E8E8;font-family:Arial,sans-serif;">
+    <div style="max-width:600px;margin:20px auto;background:#fff;border-radius:10px;overflow:hidden;">
+      <div style="background:linear-gradient(135deg,#14213D,#0D1730);padding:24px 28px;color:#FDF8F0;">
+        <div style="font-family:Georgia,serif;font-size:20px;font-weight:700;color:#FFB627;">Stufly</div>
+        <div style="font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:rgba(253,248,240,0.5);margin-top:2px;">
+          {tracker['duration_days']}-day price tracker &middot; complete
+        </div>
+      </div>
+      <div style="padding:26px 28px 8px;">
+        <p style="font-size:15px;color:#1B1F2E;margin-bottom:14px;">Hi,</p>
+        {"<span style='display:inline-block;background:#D9F0E6;color:#2F6B54;font-weight:700;font-size:11.5px;letter-spacing:0.06em;text-transform:uppercase;padding:6px 14px;border-radius:100px;margin-bottom:16px;'>Best deal found</span><br>" if best_price else ""}
+        <h1 style="font-family:Georgia,serif;font-size:21px;color:#14213D;line-height:1.4;margin:10px 0 6px;">{headline}</h1>
+        <p style="font-size:13.5px;color:#7A7362;margin-bottom:22px;">
+          You asked us to watch {origin} to {destination} across {', '.join(airlines)} for {tracker['duration_days']} days.
+          Here's how they compared &mdash; full daily breakdown in the attached sheet.
+        </p>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:22px;font-size:13px;">
+          <tr>
+            <th style="background:#14213D;color:#FDF8F0;text-align:left;padding:9px 12px;font-size:11px;letter-spacing:0.05em;text-transform:uppercase;">Airline</th>
+            <th style="background:#14213D;color:#FDF8F0;text-align:right;padding:9px 12px;font-size:11px;letter-spacing:0.05em;text-transform:uppercase;">Lowest seen</th>
+            <th style="background:#14213D;color:#FDF8F0;text-align:left;padding:9px 12px;font-size:11px;letter-spacing:0.05em;text-transform:uppercase;">On</th>
+          </tr>
+          {table_rows}
+        </table>
+      </div>
+      <div style="text-align:center;padding:6px 0 28px;">
+        <a href="https://stufly.app/search?origin={origin}&destination={destination}"
+           style="display:inline-block;background:#14213D;color:#FDF8F0;text-decoration:none;font-weight:600;font-size:14px;padding:13px 34px;border-radius:8px;">
+          Search this route on Stufly
+        </a>
+      </div>
+      <div style="background:#FDF8F0;border:1px dashed #E0DACB;border-radius:10px;margin:0 28px 26px;padding:14px 16px;font-size:12.5px;color:#7A7362;">
+        The attached Excel has a day-by-day table for all airlines you tracked, plus a summary tab with the overall cheapest option highlighted, student discount notes, and links to verify and book.
+      </div>
+      <div style="padding:18px 28px 28px;font-size:11px;color:#B4AC98;border-top:1px solid #F0EBDD;">
+        You're getting this because you set up a price tracker on Stufly for {origin} to {destination}.
+      </div>
+    </div>
+    </body></html>
+    """
+
+
 def send_tracker_report(tracker: dict):
     """
-    Puts together the finished report and emails it. This is the one place
-    where a tracker's whole story comes together -- pull the recorded
-    history, build the spreadsheet, write a short human-readable summary
-    in the email body itself (so the headline is visible without even
-    opening the attachment), and send it.
+    Puts together the finished report and emails it -- this is where a
+    tracker's whole story comes together: pull the recorded history, build
+    the spreadsheet, build the styled HTML email around it, and send both.
 
     If Gmail isn't configured, we log and quietly skip rather than
     crashing the poller -- a missing email credential shouldn't take down
@@ -401,30 +422,19 @@ def send_tracker_report(tracker: dict):
             best_price, best_airline, best_date = row["price"], row["airline"], row["checked_date"]
 
     subject = f"Your {tracker['origin']} to {tracker['destination']} tracker: results are in"
-    if best_price:
-        body = (
-            f"Hi,\n\n"
-            f"Your {tracker['duration_days']}-day tracker for {tracker['origin']} to {tracker['destination']} "
-            f"is complete. The cheapest price we saw was {best_airline} at Rs {best_price:,}, on "
-            f"{best_date.strftime('%d %b %Y')}.\n\n"
-            f"The attached spreadsheet has the full day-by-day breakdown for every airline you asked us "
-            f"to track, plus student discount info and a couple of links to verify the price and book.\n\n"
-            f"-- Stufly"
-        )
-    else:
-        body = (
-            f"Hi,\n\n"
-            f"Your tracker for {tracker['origin']} to {tracker['destination']} has finished, but we "
-            f"weren't able to find prices for the airlines you asked about during this window. "
-            f"You might want to try a fresh search on Stufly, or track again with a wider set of airlines.\n\n"
-            f"-- Stufly"
-        )
+    html_body = _build_html_email(tracker, history, best_price, best_airline, best_date)
 
-    msg = MIMEMultipart()
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
-    msg["From"] = _GMAIL_ADDRESS
+    msg["From"] = f"Stufly Price Alerts <{_GMAIL_ADDRESS}>"
     msg["To"] = tracker["email"]
-    msg.attach(MIMEText(body, "plain"))
+
+    # Attach the HTML body as its own "alternative" part -- some email
+    # clients don't render HTML, so this is the standard way to give
+    # them a real body instead of a blank email. We don't bother with a
+    # separate plain-text fallback here since the HTML is simple enough
+    # that every modern client renders it fine.
+    msg.attach(MIMEText(html_body, "html"))
 
     with open(filepath, "rb") as f:
         part = MIMEBase("application", "octet-stream")
