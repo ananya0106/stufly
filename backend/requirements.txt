@@ -9,3 +9,4 @@ joblib
 scikit-learn
 numpy
 psycopg2-binary
+openpyxl
